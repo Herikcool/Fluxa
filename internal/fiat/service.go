@@ -48,6 +48,10 @@ type Service interface {
 	HandleWebhookWithHeaders(ctx context.Context, payload []byte, headers http.Header) error
 }
 
+type TenantGetter interface {
+	GetByID(ctx context.Context, id string) (*domain.Tenant, error)
+}
+
 type service struct {
 	repo             Repository
 	eventRepo        WebhookEventRepository
@@ -56,6 +60,7 @@ type service struct {
 	transferSvc      transfer.Service
 	platformWalletID string
 	providerName     string
+	tenantRepo       TenantGetter
 }
 
 func NewService(repo Repository, rail Rail, fxSvc fx.Service, transferSvc transfer.Service, platformWalletID, providerName string, eventRepos ...WebhookEventRepository) Service {
@@ -71,6 +76,23 @@ func NewService(repo Repository, rail Rail, fxSvc fx.Service, transferSvc transf
 		transferSvc:      transferSvc,
 		platformWalletID: platformWalletID,
 		providerName:     providerName,
+	}
+}
+
+func NewServiceWithTenant(repo Repository, rail Rail, fxSvc fx.Service, transferSvc transfer.Service, platformWalletID, providerName string, tenantRepo TenantGetter, eventRepos ...WebhookEventRepository) Service {
+	var eventRepo WebhookEventRepository
+	if len(eventRepos) > 0 {
+		eventRepo = eventRepos[0]
+	}
+	return &service{
+		repo:             repo,
+		eventRepo:        eventRepo,
+		rail:             rail,
+		fxSvc:            fxSvc,
+		transferSvc:      transferSvc,
+		platformWalletID: platformWalletID,
+		providerName:     providerName,
+		tenantRepo:       tenantRepo,
 	}
 }
 
@@ -159,6 +181,31 @@ func (s *service) InitiateWithdrawal(ctx context.Context, req WithdrawRequest) (
 		return nil, err
 	}
 	req.FiatCurrency = currency
+
+	// Check daily withdrawal limit if tenant repo is available
+	tenantID := tenant.IDFromContext(ctx)
+	if tenantID != "" && s.tenantRepo != nil {
+		t, err := s.tenantRepo.GetByID(ctx, tenantID)
+		if err == nil && t != nil {
+			dailyLimit := t.GetDailyWithdrawalLimit()
+			if dailyLimit > 0 {
+				now := time.Now().UTC()
+				counter, ok := s.repo.(interface {
+					CountDailyWithdrawalsByTenant(context.Context, string, time.Time) (int, error)
+				})
+				if !ok {
+					return nil, errors.New("daily withdrawal limit counter is unavailable")
+				}
+				count, err := counter.CountDailyWithdrawalsByTenant(ctx, tenantID, now)
+				if err != nil {
+					return nil, fmt.Errorf("check daily withdrawal limit: %w", err)
+				}
+				if count >= dailyLimit {
+					return nil, domain.ErrDailyWithdrawalLimitReached
+				}
+			}
+		}
+	}
 
 	// The user states the fiat amount they want to receive; the rail tells us
 	// how much USDC that costs.
